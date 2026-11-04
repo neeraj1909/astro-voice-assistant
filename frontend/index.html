@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f7f3eb" />
+    <title>Starlight — Astrology chat</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="Starlight home"><span class="brand-mark" aria-hidden="true">✳</span> starlight</a>
+        <span class="top-note">A little space to reflect</span>
+      </header>
+
+      <section class="chat-card" aria-labelledby="page-title">
+        <div class="intro">
+          <p class="eyebrow">YOUR ASTROLOGY COMPANION</p>
+          <h1 id="page-title">Find a moment of clarity.</h1>
+          <p class="intro-copy">Ask what’s on your mind. Explore astrology as a tool for reflection.</p>
+        </div>
+
+        <div id="conversation" class="conversation" role="log" aria-label="Conversation" aria-live="polite" aria-relevant="additions text">
+          <div id="welcome" class="welcome">
+            <span class="welcome-star" aria-hidden="true">☼</span>
+            <p>Your conversation starts here.</p>
+            <p class="welcome-hint">Try asking about a theme, a relationship, or a decision you’re thinking through.</p>
+          </div>
+        </div>
+
+        <div class="voice-row">
+          <button id="mic-button" class="button button-soft" type="button" aria-pressed="false" aria-describedby="voice-help">
+            <span aria-hidden="true">◉</span><span id="mic-label">Speak a message</span>
+          </button>
+          <p id="voice-help" class="voice-help">Speech input is turn-based. Your browser may use a remote speech service; review the transcript before sending.</p>
+        </div>
+
+        <section class="local-audio" aria-labelledby="local-audio-title">
+          <div class="local-audio-heading">
+            <div>
+            <p class="eyebrow">LOCAL RECORDING · ENGLISH TRANSCRIPTION</p>
+              <h2 id="local-audio-title">Record for transcription</h2>
+            </div>
+            <span class="duration-badge">UP TO 30 SEC</span>
+          </div>
+          <p class="local-audio-copy">Recording stays in this page until you choose <strong>Transcribe recording</strong>. That action sends a 16 kHz WAV to this app’s English transcription endpoint. The service may temporarily spool audio to disk and removes it when processing finishes. Discarding cancels the browser request where possible, but may not stop server processing. This page does not retain raw audio after transcription or discard.</p>
+          <label class="consent-label" for="local-consent">
+            <input id="local-consent" type="checkbox" />
+            <span>I agree to record audio and send it to this app’s transcription endpoint after capture.</span>
+          </label>
+          <div class="local-audio-actions">
+            <button id="local-record" class="button button-soft" type="button" disabled>Start recording</button>
+            <button id="local-stop" class="button button-soft" type="button" hidden>Stop recording</button>
+            <button id="local-transcribe" class="button button-primary" type="button" hidden>Transcribe recording</button>
+            <button id="local-discard" class="text-button" type="button" hidden>Discard recording</button>
+          </div>
+          <p id="local-status" class="local-status" role="status" aria-live="polite">No audio is recording or waiting to be sent.</p>
+        </section>
+
+        <form id="chat-form" class="composer">
+          <label class="sr-only" for="message">Your message</label>
+          <textarea id="message" name="message" rows="2" maxlength="4000" placeholder="Write your message…" required></textarea>
+          <div class="composer-bottom">
+            <span class="composer-note">Your message goes to the chat service when you choose Send.</span>
+            <button id="send-button" class="button button-primary" type="submit"><span>Send</span><span aria-hidden="true">↗</span></button>
+          </div>
+        </form>
+        <div id="status" class="status" role="status" aria-live="polite"></div>
+      </section>
+
+      <footer>This demo saves a browser ID so the chat service can associate visits; memory depends on service support. It is not an account. Browser speech may use a remote service. Astrology is for reflection, not professional advice.</footer>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
