@@ -2,16 +2,36 @@ from __future__ import annotations
 
 from pathlib import Path
 import io
+import os
 import sys
 import types
 import wave
 
 import httpx
 import pytest
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 from streamlit_app import GatewayError, post_chat, post_transcription, validate_recording
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
+
+
+@pytest.fixture(autouse=True)
+def identity_signing_key_file(tmp_path, monkeypatch):
+    key = Ed25519PrivateKey.generate()
+    path = tmp_path / "identity-private.pem"
+    path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    path.chmod(0o600)
+    monkeypatch.setenv("ASTRO_IDENTITY_PRIVATE_KEY_FILE", str(path))
+    return key
 
 
 def test_auth_gate_shows_local_account_forms_before_chat(tmp_path, monkeypatch):
@@ -22,6 +42,10 @@ def test_auth_gate_shows_local_account_forms_before_chat(tmp_path, monkeypatch):
     assert [tab.label for tab in app.tabs] == ["Sign in", "Create local account"]
     assert len(app.text_area) == 0
     assert any("local demo account" in item.value for item in app.caption)
+    warning_text = " ".join(item.value for item in app.warning)
+    assert "upstream assignment API itself has no authentication" in warning_text
+    assert "directly can choose an ID" in warning_text
+    assert "direct gateway callers" not in warning_text
 
 
 def test_local_account_registration_gates_chat_and_uses_server_account_id(tmp_path, monkeypatch):
@@ -42,6 +66,7 @@ def test_local_account_registration_gates_chat_and_uses_server_account_id(tmp_pa
 def test_chat_posts_account_identity_and_reset_rotates_session(tmp_path, monkeypatch):
     monkeypatch.setenv("ASTRO_ACCOUNTS_DB", str(tmp_path / "accounts.sqlite3"))
     monkeypatch.setenv("ASTRO_GATEWAY_TOKEN", "test-only-token-with-at-least-32-chars")
+    monkeypatch.setenv("CHAT_CLIENT_TIMEOUT_SECONDS", "245")
     posted: list[tuple[str, dict]] = []
 
     def fake_post(url, **kwargs):
@@ -62,6 +87,7 @@ def test_chat_posts_account_identity_and_reset_rotates_session(tmp_path, monkeyp
     app.button(key="send_message").click().run()
 
     assert posted[0][0] == "http://127.0.0.1:8000/api/chat"
+    assert posted[0][1]["timeout"] == 245
     assert posted[0][1]["json"] == {
         "user_id": "acct-17",
         "session_id": "session-before",
@@ -70,6 +96,7 @@ def test_chat_posts_account_identity_and_reset_rotates_session(tmp_path, monkeyp
     assert (
         posted[0][1]["headers"]["Authorization"] == "Bearer test-only-token-with-at-least-32-chars"
     )
+    assert posted[0][1]["headers"]["X-Astro-Identity"]
     assert any("A controlled reply." in item.value for item in app.markdown)
     assert app.text_area(key="draft_1").value == ""
 
@@ -99,7 +126,9 @@ def test_audio_requires_prior_consent_and_explicit_transcribe_action(tmp_path, m
     app.run()
 
     assert len(app.audio_input) == 0
-    assert any("English-only" in item.value for item in app.caption)
+    assert any(
+        "Mixed-language recognition has not been validated" in item.value for item in app.caption
+    )
 
     consent = app.checkbox(key="audio_consent_0")
     consent.set_value(True).run()
@@ -149,6 +178,24 @@ def test_gateway_client_requires_server_token_and_never_leaks_it_to_chat_payload
         calls[0][1]["headers"]["Authorization"] == "Bearer server-only-token-with-at-least-32-chars"
     )
     assert "server-only-token-with-at-least-32-chars" not in calls[0][1]["json"].values()
+
+
+def test_gateway_client_fails_closed_without_identity_signing_key(monkeypatch):
+    monkeypatch.setenv("ASTRO_GATEWAY_TOKEN", "server-only-token-with-at-least-32-chars")
+    monkeypatch.delenv("ASTRO_IDENTITY_PRIVATE_KEY_FILE", raising=False)
+    monkeypatch.setattr(httpx, "post", lambda *_args, **_kwargs: pytest.fail("must not send"))
+    with pytest.raises(GatewayError, match="identity signing is not configured"):
+        post_chat("acct", "session", "hello")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX private-key modes")
+def test_gateway_client_rejects_group_or_world_readable_signing_key(monkeypatch):
+    key_path = Path(os.environ["ASTRO_IDENTITY_PRIVATE_KEY_FILE"])
+    key_path.chmod(0o644)
+    monkeypatch.setenv("ASTRO_GATEWAY_TOKEN", "server-only-token-with-at-least-32-chars")
+    monkeypatch.setattr(httpx, "post", lambda *_args, **_kwargs: pytest.fail("must not send"))
+    with pytest.raises(GatewayError, match="permissions must be 0600"):
+        post_chat("acct", "session", "hello")
 
 
 def test_gateway_client_rejects_short_whitespace_and_non_ascii_tokens(monkeypatch):
@@ -207,11 +254,11 @@ def test_read_aloud_is_explicit_local_and_clears_after_new_turn(tmp_path, monkey
     synthesized = []
     tts_module = types.ModuleType("app.local_tts")
 
-    def synthesize_wav_sync(text, language="en"):
-        synthesized.append((text, language))
+    def synthesize_multilingual_wav_sync(text):
+        synthesized.append(text)
         return b"fake-wav"
 
-    tts_module.synthesize_wav_sync = synthesize_wav_sync
+    tts_module.synthesize_multilingual_wav_sync = synthesize_multilingual_wav_sync
     monkeypatch.setitem(sys.modules, "app.local_tts", tts_module)
     app = AppTest.from_file(APP_PATH).run()
     app.session_state["account_id"] = "acct-17"
@@ -222,12 +269,9 @@ def test_read_aloud_is_explicit_local_and_clears_after_new_turn(tmp_path, monkey
 
     assert synthesized == []
     assert any(button.label == "Read aloud" for button in app.button)
-    language_select = next(
-        item for item in app.selectbox if item.label == "Read the latest reply in"
-    )
-    language_select.set_value("Hindi").run()
+    assert not app.selectbox
     next(button for button in app.button if button.label == "Read aloud").click().run()
-    assert synthesized == [("A reflective answer.", "hi")]
+    assert synthesized == ["A reflective answer."]
     assert app.session_state["reply_audio"] == b"fake-wav"
 
     app.session_state["messages"].append({"role": "user", "content": "new turn"})
@@ -256,6 +300,36 @@ def test_live_voice_receives_authenticated_ids_and_server_callbacks(tmp_path, mo
     assert (user_id, session_id) == ("acct-17", "session-a")
     assert callbacks["transcribe"].__name__ == "post_transcription"
     assert callbacks["chat"].__name__ == "post_chat"
+
+
+def test_live_voice_shell_uses_component_transcript_once_without_extra_heading(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ASTRO_ACCOUNTS_DB", str(tmp_path / "accounts.sqlite3"))
+    monkeypatch.setenv("ASTRO_GATEWAY_TOKEN", "test-only-token-with-at-least-32-chars")
+    live_module = types.ModuleType("app.live_voice")
+
+    def render_live_voice(*_args, **_kwargs):
+        for message in st.session_state.get("messages", []):
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+    live_module.render_live_voice = render_live_voice
+    monkeypatch.setitem(sys.modules, "app.live_voice", live_module)
+
+    app = AppTest.from_file(APP_PATH).run()
+    app.session_state["account_id"] = "acct-17"
+    app.session_state["username"] = "demo-user"
+    app.session_state["session_id"] = "session-a"
+    app.session_state["messages"] = [
+        {"role": "user", "content": "A transcript turn"},
+        {"role": "assistant", "content": "One assistant reply"},
+    ]
+    app.run()
+
+    assert sum(item.value == "A transcript turn" for item in app.markdown) == 1
+    assert sum(item.value == "One assistant reply" for item in app.markdown) == 1
+    assert all("Voice conversation" not in item.value for item in app.markdown)
 
 
 @pytest.mark.parametrize(
@@ -305,8 +379,11 @@ def test_reset_and_logout_release_live_voice_runtime_immediately(tmp_path, monke
     app.session_state["_live_voice_runtime"] = first_runtime
     app.button(key="new_conversation").click().run()
     assert first_runtime.released
-    assert "_live_voice_runtime" not in app.session_state
     assert app.session_state["session_id"] != "session-a"
+    assert app.session_state["_live_voice_runtime"].owner == (
+        "acct-17",
+        app.session_state["session_id"],
+    )
 
     second_runtime = Runtime()
     app.session_state["_live_voice_runtime"] = second_runtime

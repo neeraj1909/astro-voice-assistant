@@ -20,6 +20,8 @@ from urllib.request import ProxyHandler, build_opener
 
 import pytest
 from streamlit.testing.v1 import AppTest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -150,6 +152,23 @@ def test_streamlit_login_memory_cross_session_and_optional_voice_e2e(
     gateway_url = f"http://127.0.0.1:{gateway_port}"
     runner_path = tmp_path / "assignment_e2e_server.py"
     runner_path.write_text(ASSIGNMENT_RUNNER, encoding="utf-8")
+    signing_key = Ed25519PrivateKey.generate()
+    private_key_path = tmp_path / "identity-private.pem"
+    public_key_path = tmp_path / "identity-public.pem"
+    private_key_path.write_bytes(
+        signing_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    public_key_path.write_bytes(
+        signing_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    private_key_path.chmod(0o600)
     synthetic_wav = b""
     phrase = "Please turn left at the next street."
     if run_local_asr:
@@ -202,6 +221,8 @@ def test_streamlit_login_memory_cross_session_and_optional_voice_e2e(
         {
             "CHAT_API_URL": f"{assignment_url}/chat",
             "ASTRO_GATEWAY_TOKEN": GATEWAY_TOKEN,
+            "ASTRO_IDENTITY_PUBLIC_KEY_FILE": str(public_key_path),
+            "ASTRO_GATEWAY_REPLAY_DB": str(tmp_path / "gateway-replays.sqlite3"),
             "CHAT_API_TIMEOUT_SECONDS": "15",
             "PYTHONPATH": str(WORKSPACE),
             "NO_PROXY": "127.0.0.1,localhost",
@@ -261,6 +282,7 @@ def test_streamlit_login_memory_cross_session_and_optional_voice_e2e(
 
         monkeypatch.setenv("GATEWAY_URL", gateway_url)
         monkeypatch.setenv("ASTRO_GATEWAY_TOKEN", GATEWAY_TOKEN)
+        monkeypatch.setenv("ASTRO_IDENTITY_PRIVATE_KEY_FILE", str(private_key_path))
         monkeypatch.setenv("ASTRO_ACCOUNTS_DB", str(tmp_path / "accounts.sqlite3"))
         app_path = WORKSPACE / "streamlit_app.py"
 
