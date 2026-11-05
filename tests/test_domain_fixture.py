@@ -35,6 +35,40 @@ def test_domain_fixture_has_supported_top_level_shape(corpus: dict[str, Any]) ->
     assert isinstance(corpus.get("cases"), list) and corpus["cases"]
 
 
+def test_fixture_does_not_claim_runtime_domain_enforcement(corpus: dict[str, Any]) -> None:
+    capabilities = corpus["current_gateway_capabilities"]
+    assert capabilities.get("forwards_message_without_astrology_policy") is True
+    assert capabilities.get("astrology_domain_policy_implemented") is False
+    assert capabilities.get("domain_evaluation_status") == "model_smoke_incomplete_no_acceptance"
+
+
+def test_domain_cases_cover_in_scope_and_redirect_languages(corpus: dict[str, Any]) -> None:
+    cases = {case["id"]: case for case in corpus["cases"]}
+    expected_in_scope = {
+        "astro_en_missing_birth_inputs": "en",
+        "astro_hi_reflective_career": "hi",
+        "astro_bn_missing_time": "bn",
+        "astro_hinglish_data_limits": "hi-Latn-en",
+    }
+    expected_redirects = {
+        "switch_en_back_to_chart": "en",
+        "switch_hi_astro_to_cooking": "hi",
+        "switch_bn_to_cooking": "bn",
+        "switch_hinglish_to_device_support": "hi-Latn-en",
+    }
+
+    for case_id, language in expected_in_scope.items():
+        assert cases[case_id]["language"] == language
+        assert cases[case_id]["category"].startswith("astrology_")
+    for case_id, language in expected_redirects.items():
+        assert cases[case_id]["language"] == language
+        assert cases[case_id]["category"] == "topic_switch"
+        assert cases[case_id].get("forbidden_behavior"), (
+            f"{case_id}: redirect case must state the out-of-scope behavior to avoid"
+        )
+    assert cases["switch_bn_astrology_to_emergency"]["category"] == "topic_switch_safety"
+
+
 def test_domain_fixture_cases_are_well_formed(corpus: dict[str, Any]) -> None:
     seen_ids: set[str] = set()
     for case in corpus["cases"]:
