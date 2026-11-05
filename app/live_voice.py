@@ -51,6 +51,7 @@ class LiveVoiceEvent:
     turn_id: int
     text: str = ""
     message: str = ""
+    response_turn_id: int | None = None
 
 
 def _rms_pcm16(pcm: bytes) -> float:
@@ -226,6 +227,7 @@ def _webrtc_audio_options(owner_key: str, source, sink) -> dict:
         # true is required by streamlit-webrtc's output-track send gate.
         "sendback_audio": True,
         "media_stream_constraints": {"audio": True, "video": False},
+        "translations": {"start": "Start talking", "stop": "End conversation"},
     }
 
 
@@ -242,7 +244,7 @@ class LiveVoiceRuntime:
         synthesize: Callable[[str, str], bytes],
         source=None,
         detector: EnergyTurnDetector | None = None,
-        language: str = "en",
+        language: str = "auto",
     ) -> None:
         if not user_id or not session_id:
             raise ValueError("Live voice requires an authenticated user and session")
@@ -266,6 +268,8 @@ class LiveVoiceRuntime:
         # Reservation spans synthesis, queued output, and playback. It prevents
         # automatic speech and the manual fallback from duplicating one turn.
         self._speech_turn_id: int | None = None
+        self._thinking_turn_id: int | None = None
+        self._last_error: str | None = None
         self._latest_reply: tuple[int, str] | None = None
         self._released = threading.Event()
         self._jobs: queue.Queue[tuple[str, int, str | bytes, str] | None] = queue.Queue(maxsize=2)
@@ -284,6 +288,33 @@ class LiveVoiceRuntime:
     @property
     def is_released(self) -> bool:
         return self._released.is_set()
+
+    @property
+    def status(self) -> str:
+        """Return the current audio state without reporting stale turns."""
+        with self._lock:
+            if self._detector.is_user_speaking:
+                return "Listening to you"
+            if self._detector.is_assistant_speaking:
+                return "Speaking"
+            if self._last_error:
+                return "Voice error"
+            if (
+                self._thinking_turn_id == self._detector.current_turn_id
+                and self._thinking_turn_id is not None
+            ):
+                return "Thinking…"
+            return "Listening to you"
+
+    @property
+    def last_error(self) -> str | None:
+        with self._lock:
+            return self._last_error
+
+    def _finish_thinking(self, turn_id: int) -> None:
+        with self._lock:
+            if self._thinking_turn_id == turn_id:
+                self._thinking_turn_id = None
 
     @property
     def latest_reply(self) -> tuple[int, str] | None:
@@ -309,8 +340,8 @@ class LiveVoiceRuntime:
 
     @staticmethod
     def _validate_language(language: str) -> str:
-        if language not in {"en", "hi", "bn"}:
-            raise ValueError("read-aloud language must be en, hi, or bn")
+        if language not in {"auto", "en", "hi", "bn"}:
+            raise ValueError("read-aloud language must be auto, en, hi, or bn")
         return language
 
     def attach_source(self, source) -> None:
@@ -354,6 +385,8 @@ class LiveVoiceRuntime:
             events = self._detector.observe_pcm(pcm, at=at)
             start_event = next((event for event in events if event.kind == "speech_start"), None)
             if start_event is not None:
+                self._thinking_turn_id = None
+                self._last_error = None
                 if self._speech_turn_id is not None and self._speech_turn_id != start_event.turn_id:
                     # A barge-in also invalidates TTS that is still synthesizing
                     # and has not yet reached the output track.
@@ -383,7 +416,12 @@ class LiveVoiceRuntime:
             for event in events:
                 if event.kind == "interrupt":
                     self._put_event(
-                        LiveVoiceEvent("interrupted", event.turn_id, message="Playback stopped.")
+                        LiveVoiceEvent(
+                            "interrupted",
+                            event.turn_id,
+                            message="Playback stopped.",
+                            response_turn_id=event.response_turn_id,
+                        )
                     )
             return events
 
@@ -399,6 +437,7 @@ class LiveVoiceRuntime:
             )
         elif self._utterance:
             wav_bytes = _wav_from_pcm16(bytes(self._utterance))
+            self._thinking_turn_id = turn_id
             try:
                 self._jobs.put_nowait(("turn", turn_id, wav_bytes, ""))
             except queue.Full:
@@ -410,6 +449,7 @@ class LiveVoiceRuntime:
                 try:
                     self._jobs.put_nowait(("turn", turn_id, wav_bytes, ""))
                 except queue.Full:
+                    self._thinking_turn_id = None
                     self._put_event(
                         LiveVoiceEvent(
                             "error", turn_id, message="Voice processing is busy; try again shortly."
@@ -463,6 +503,7 @@ class LiveVoiceRuntime:
             if not self._current(turn_id):
                 self._put_event(LiveVoiceEvent("stale_response", turn_id))
                 continue
+            stage = "transcription" if kind == "turn" else "speech playback"
             try:
                 if kind == "turn":
                     transcript = self._transcribe(content)  # type: ignore[arg-type]
@@ -471,17 +512,20 @@ class LiveVoiceRuntime:
                         continue
                     transcript = transcript.strip() if isinstance(transcript, str) else ""
                     if not transcript:
+                        self._finish_thinking(turn_id)
                         self._put_event(
                             LiveVoiceEvent("error", turn_id, message="No speech was recognized.")
                         )
                         continue
                     self._put_event(LiveVoiceEvent("user", turn_id, text=transcript))
+                    stage = "chat service"
                     reply = self._chat(self.user_id, self.session_id, transcript)
                     if not self._current(turn_id):
                         self._put_event(LiveVoiceEvent("stale_response", turn_id))
                         continue
                     reply = reply.strip() if isinstance(reply, str) else ""
                     if not reply:
+                        self._finish_thinking(turn_id)
                         self._put_event(
                             LiveVoiceEvent(
                                 "error", turn_id, message="The chat service returned no reply."
@@ -499,12 +543,9 @@ class LiveVoiceRuntime:
                     self._speak(turn_id, content, language, reserved=True)  # type: ignore[arg-type]
             except Exception:
                 # Don't put exception text, audio, or transcript content in UI/logs.
-                message = (
-                    "Local transcription failed."
-                    if kind == "turn"
-                    else "Local speech playback failed."
-                )
+                message = f"The {stage} failed. Please try again."
                 if self._current(turn_id):
+                    self._finish_thinking(turn_id)
                     self._put_event(LiveVoiceEvent("error", turn_id, message=message))
 
     def _speak(self, turn_id: int, text: str, language: str, *, reserved: bool) -> None:
@@ -523,6 +564,7 @@ class LiveVoiceRuntime:
             wav_bytes = self._synthesize(text, language)
             pcm = _wav_to_pcm24k(wav_bytes)
         except Exception:
+            self._finish_thinking(turn_id)
             with self._lock:
                 if self._speech_turn_id == turn_id:
                     self._speech_turn_id = None
@@ -538,11 +580,13 @@ class LiveVoiceRuntime:
                 self._put_event(LiveVoiceEvent("stale_response", turn_id))
                 return
             if self._source is None or not self._detector.assistant_started(turn_id):
+                self._finish_thinking(turn_id)
                 if self._speech_turn_id == turn_id:
                     self._speech_turn_id = None
                 self._put_event(LiveVoiceEvent("stale_response", turn_id))
                 return
             self._source.push(pcm)
+            self._thinking_turn_id = None
             self._playing_turn_id = turn_id
             self._speaker_deadline = (
                 max(self._last_audio_at or 0.0, time.monotonic())
@@ -556,6 +600,10 @@ class LiveVoiceRuntime:
             return not self.is_released and self._detector.is_response_current(turn_id)
 
     def _put_event(self, event: LiveVoiceEvent) -> None:
+        if event.kind == "error":
+            with self._lock:
+                if self._detector.is_response_current(event.turn_id):
+                    self._last_error = event.message
         try:
             self._events.put_nowait(event)
         except queue.Full:
@@ -585,6 +633,8 @@ class LiveVoiceRuntime:
             self._released.set()
             self._detector.release()
             self._playing_turn_id = None
+            self._thinking_turn_id = None
+            self._last_error = None
             self._speech_turn_id = None
             self._utterance.clear()
             self._pre_roll.clear()
@@ -610,17 +660,42 @@ def _owner_key(user_id: str, session_id: str) -> str:
     return hashlib.sha256(f"{user_id}\0{session_id}".encode()).hexdigest()[:16]
 
 
+def _record_live_voice_event(messages: list[dict], event: LiveVoiceEvent) -> None:
+    """Add recognized/generated turns or annotate an actually interrupted reply."""
+    if event.kind in {"user", "assistant"}:
+        messages.append({"role": event.kind, "content": event.text, "voice_turn_id": event.turn_id})
+        return
+    if event.kind != "interrupted" or event.response_turn_id is None:
+        return
+    for message in reversed(messages):
+        if (
+            message.get("role") == "assistant"
+            and message.get("voice_turn_id") == event.response_turn_id
+        ):
+            message["voice_playback_interrupted"] = True
+            break
+
+
 @st.fragment(run_every=0.2)
-def _render_runtime(runtime: LiveVoiceRuntime, owner_key: str, language: str) -> None:
+def _render_runtime(runtime: LiveVoiceRuntime, owner_key: str, language: str, connection) -> None:
+    if connection.state.playing and not runtime.is_released:
+        st.caption(runtime.status)
+    elif connection.state.signalling:
+        st.caption("Connecting…")
+    else:
+        st.caption("Ready")
     for event in runtime.drain_events():
         if event.kind in {"user", "assistant"}:
             _clear_reply_audio_state()
             messages = st.session_state.setdefault("messages", [])
-            messages.append({"role": event.kind, "content": event.text})
-        elif event.kind == "error":
-            st.warning(event.message)
+            _record_live_voice_event(messages, event)
         elif event.kind == "interrupted":
+            messages = st.session_state.setdefault("messages", [])
+            _record_live_voice_event(messages, event)
             st.caption("Reply stopped. Listening for your next turn.")
+
+    if runtime.last_error:
+        st.warning(runtime.last_error)
 
     live_messages = [
         message
@@ -631,6 +706,8 @@ def _render_runtime(runtime: LiveVoiceRuntime, owner_key: str, language: str) ->
         for message in live_messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
+                if message.get("voice_playback_interrupted"):
+                    st.caption("Audio playback was interrupted; the spoken portion is unknown.")
 
     latest = runtime.latest_reply
     if latest is not None:
@@ -655,7 +732,7 @@ def render_live_voice(
     transcribe: Callable[[bytes], str],
     chat: Callable[[str, str, str], str],
 ) -> None:
-    """Render consent-gated live microphone capture for one authenticated session.
+    """Render browser-permission-gated microphone capture for one authenticated session.
 
     Gateway adapter callables remain server-side. This function never passes a
     bearer credential or account ID to the browser; the WebRTC component receives
@@ -669,39 +746,18 @@ def render_live_voice(
         st.session_state.pop(_RUNTIME_KEY, None)
         runtime = None
 
-    st.markdown("#### Live voice (prototype)")
-    st.caption(
-        "Live audio is streamed to this app and endpointed locally with a simple energy VAD. "
-        "Completed turns use the configured local Whisper service, then send recognized text "
-        "to the configured chat service. Spoken replies are synthesized locally. If a buffered "
-        "ASR/chat request is already in flight when you interrupt, this UI suppresses its late "
-        "reply but cannot cancel the request or undo an upstream conversation update."
-    )
-    language = st.selectbox(
-        "Read-aloud voice",
-        options=("en", "hi", "bn"),
-        format_func={"en": "English", "hi": "हिन्दी", "bn": "বাংলা"}.__getitem__,
-        key=f"live_voice_language_{owner_key}",
-    )
-    consent = st.checkbox(
-        "I consent to stream microphone audio and automatically play local spoken replies while live voice is active.",
-        key=f"live_voice_consent_{owner_key}",
-    )
-    if not consent:
-        if runtime is not None:
-            runtime.release()
-            st.session_state.pop(_RUNTIME_KEY, None)
-        return
+    st.caption("Start talking, then pause for a reply. Speak again to interrupt.")
+    language = "auto"
 
     if runtime is None:
-        from app.local_tts import synthesize_wav_sync
+        from app.local_tts import synthesize_multilingual_wav_sync
 
         runtime = LiveVoiceRuntime(
             user_id=user_id,
             session_id=session_id,
             transcribe=transcribe,
             chat=chat,
-            synthesize=synthesize_wav_sync,
+            synthesize=synthesize_multilingual_wav_sync,
         )
         st.session_state[_RUNTIME_KEY] = runtime
     runtime.set_language(language)
@@ -717,12 +773,8 @@ def render_live_voice(
         key=f"live_voice_sink_{owner_key}",
         on_ended=runtime.release,
     )
-    webrtc_streamer(**_webrtc_audio_options(owner_key, source, sink))
-    st.caption(
-        "The microphone remains active during read-aloud. Sustained speech clears queued playback. "
-        "This RMS VAD is sensitive to microphone gain and background noise."
-    )
-    _render_runtime(runtime, owner_key, language)
+    connection = webrtc_streamer(**_webrtc_audio_options(owner_key, source, sink))
+    _render_runtime(runtime, owner_key, language, connection)
 
 
 def release_live_voice() -> None:

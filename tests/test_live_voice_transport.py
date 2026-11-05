@@ -211,7 +211,7 @@ async def _exercise_peer_transport() -> None:
                 "A synthetic voice asks about the stars.",
             )
         ]
-        assert tts_calls == [("The synthetic stars reply locally.", "en")]
+        assert tts_calls == [("The synthetic stars reply locally.", "auto")]
 
         first_reply_turn = runtime.latest_reply[0] if runtime.latest_reply else None
         assert first_reply_turn is not None

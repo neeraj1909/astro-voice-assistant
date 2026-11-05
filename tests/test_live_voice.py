@@ -7,7 +7,12 @@ import wave
 
 import pytest
 
-from app.live_voice import EnergyTurnDetector, LiveVoiceRuntime, _webrtc_audio_options
+from app.live_voice import (
+    EnergyTurnDetector,
+    LiveVoiceRuntime,
+    _record_live_voice_event,
+    _webrtc_audio_options,
+)
 
 
 def pcm(amplitude: int, *, samples: int = 320) -> bytes:
@@ -117,6 +122,28 @@ def test_sustained_barge_in_clears_playback_and_invalidates_old_turn():
         assert source.clear_count == 1
         assert not runtime.is_response_current(first_turn)
         assert not detector.is_assistant_speaking
+
+        live_events = runtime.drain_events()
+        assistant = next(event for event in live_events if event.kind == "assistant")
+        interrupted = next(event for event in live_events if event.kind == "interrupted")
+        assert assistant.turn_id == first_turn
+        assert interrupted.response_turn_id == first_turn
+        assert not any(
+            event.kind == "user" and event.turn_id != first_turn for event in live_events
+        )
+
+        messages = []
+        _record_live_voice_event(messages, assistant)
+        _record_live_voice_event(messages, interrupted)
+        _record_live_voice_event(messages, interrupted)
+        assert messages == [
+            {
+                "role": "assistant",
+                "content": "answer",
+                "voice_turn_id": first_turn,
+                "voice_playback_interrupted": True,
+            }
+        ]
     finally:
         runtime.release()
 
@@ -171,10 +198,9 @@ def test_endpoint_sends_bounded_wav_through_session_owned_gateway_calls():
                 16000,
             )
 
-        # Spoken output is automatic only after the live-mode consent checkbox
-        # has enabled this runtime.
+        # Spoken output follows a completed voice turn automatically.
         assert wait_for(lambda: bool(source.pushed))
-        assert tts_calls == [("Take a quiet moment to reflect.", "en")]
+        assert tts_calls == [("Take a quiet moment to reflect.", "auto")]
         assistant = next(event for event in events if event.kind == "assistant")
         assert assistant.turn_id == runtime.latest_reply[0]
     finally:
@@ -217,12 +243,76 @@ def test_manual_replay_is_rejected_while_automatic_tts_is_pending_or_playing():
 
         finish_synth.set()
         assert wait_for(lambda: bool(source.pushed))
-        assert synth_calls == [("one spoken reply", "en")]
+        assert synth_calls == [("one spoken reply", "auto")]
         assert len(source.pushed) == 1
         assert not runtime.can_read_aloud(turn_id)
         assert not runtime.play_audio(turn_id, reply, language="en")
     finally:
         finish_synth.set()
+        runtime.release()
+
+
+def test_status_tracks_processing_speech_and_interruption():
+    entered = threading.Event()
+    finish = threading.Event()
+    source = FakePcmSource()
+
+    def transcribe(_audio):
+        entered.set()
+        assert finish.wait(3)
+        return "hello"
+
+    runtime = LiveVoiceRuntime(
+        user_id="user",
+        session_id="session",
+        transcribe=transcribe,
+        chat=lambda *_: "hello back",
+        synthesize=lambda *_: wav(pcm(1000, samples=1600)),
+        source=source,
+        detector=EnergyTurnDetector(speech_start_seconds=0.04, endpoint_silence_seconds=0.1),
+    )
+    try:
+        for at, amplitude in [(0, 2500), (0.04, 2500), (0.08, 2500), (0.12, 0), (0.23, 0)]:
+            runtime.observe_pcm(pcm(amplitude), at=at)
+        assert entered.wait(1)
+        assert runtime.status == "Thinking…"
+        finish.set()
+        assert wait_for(lambda: bool(source.pushed))
+        assert runtime.status == "Speaking"
+        for at in (0.30, 0.35, 0.40):
+            runtime.observe_pcm(pcm(2500), at=at)
+        assert runtime.status == "Listening to you"
+        assert source.clear_count > 0
+    finally:
+        finish.set()
+        runtime.release()
+
+
+def test_chat_failure_stays_visible_until_next_speech():
+    def fail_chat(*_args):
+        raise RuntimeError("private backend details")
+
+    runtime = LiveVoiceRuntime(
+        user_id="user",
+        session_id="session",
+        transcribe=lambda _audio: "hello",
+        chat=fail_chat,
+        synthesize=lambda *_: wav(pcm(1000)),
+        source=FakePcmSource(),
+        detector=EnergyTurnDetector(speech_start_seconds=0.04, endpoint_silence_seconds=0.1),
+    )
+    try:
+        for at, amplitude in [(0, 2500), (0.04, 2500), (0.08, 2500), (0.12, 0), (0.23, 0)]:
+            runtime.observe_pcm(pcm(amplitude), at=at)
+        assert wait_for(lambda: runtime.last_error is not None)
+        runtime.drain_events()
+        assert runtime.status == "Voice error"
+        assert runtime.last_error == "The chat service failed. Please try again."
+        for at in (0.30, 0.35, 0.40):
+            runtime.observe_pcm(pcm(2500), at=at)
+        assert runtime.last_error is None
+        assert runtime.status == "Listening to you"
+    finally:
         runtime.release()
 
 
@@ -326,3 +416,7 @@ def test_webrtc_uses_wrapper_track_and_keeps_audio_sendback_enabled():
     assert options["source_audio_track"] is source.track
     assert options["sink_audio_track"] is sink
     assert options["sendback_audio"] is True
+    assert options["translations"] == {
+        "start": "Start talking",
+        "stop": "End conversation",
+    }
