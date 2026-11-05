@@ -43,7 +43,9 @@ async def _read_audio(request: Request) -> bytes:
 
 
 def _configured_language(model: str) -> str:
-    language = os.getenv("WHISPER_LANGUAGE", "en").strip().casefold()
+    # whisper.cpp accepts "auto" for its multilingual models. An explicit
+    # deployment setting still takes precedence for predictable workloads.
+    language = os.getenv("WHISPER_LANGUAGE", "auto").strip().casefold()
     if not _WHISPER_LANGUAGE_PATTERN.fullmatch(language):
         raise HTTPException(
             status_code=503,

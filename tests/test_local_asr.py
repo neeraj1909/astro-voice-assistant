@@ -67,7 +67,8 @@ def test_transcribe_uses_configured_local_cli_and_returns_text(monkeypatch) -> N
         return CompletedProcess()
 
     monkeypatch.setenv("WHISPER_CLI", "/local/whisper-cli")
-    monkeypatch.setenv("WHISPER_MODEL", "/local/ggml-tiny.en.bin")
+    monkeypatch.setenv("WHISPER_MODEL", "/local/ggml-small.bin")
+    monkeypatch.delenv("WHISPER_LANGUAGE", raising=False)
     monkeypatch.setattr("app.local_asr.asyncio.create_subprocess_exec", fake_exec)
     with TestClient(create_app("http://chat.test/chat", gateway_token=GATEWAY_TOKEN)) as client:
         response = post_wav(client, wav_bytes())
@@ -77,11 +78,11 @@ def test_transcribe_uses_configured_local_cli_and_returns_text(monkeypatch) -> N
     assert calls[0][:5] == (
         "/local/whisper-cli",
         "-m",
-        "/local/ggml-tiny.en.bin",
+        "/local/ggml-small.bin",
         "-t",
         "2",
     )
-    assert calls[0][calls[0].index("-l") + 1] == "en"
+    assert calls[0][calls[0].index("-l") + 1] == "auto"
     assert calls[0][calls[0].index("-f") + 1].endswith(".wav")
     assert len(temp_dirs) == 1 and not temp_dirs[0].exists()
 
@@ -122,6 +123,25 @@ def test_transcribe_supports_explicit_indic_language(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert calls[0][calls[0].index("-l") + 1] == "bn"
+
+
+def test_transcribe_preserves_explicit_language_override(monkeypatch) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        Path(args[args.index("-of") + 1]).with_suffix(".txt").write_text("hello")
+        return CompletedProcess()
+
+    monkeypatch.setenv("WHISPER_CLI", "/local/whisper-cli")
+    monkeypatch.setenv("WHISPER_MODEL", "/local/ggml-small.bin")
+    monkeypatch.setenv("WHISPER_LANGUAGE", "en")
+    monkeypatch.setattr("app.local_asr.asyncio.create_subprocess_exec", fake_exec)
+    with TestClient(create_app("http://chat.test/chat", gateway_token=GATEWAY_TOKEN)) as client:
+        response = post_wav(client, wav_bytes())
+
+    assert response.status_code == 200
+    assert calls[0][calls[0].index("-l") + 1] == "en"
 
 
 def test_transcribe_rejects_unsafe_language_without_invoking_cli(monkeypatch) -> None:
