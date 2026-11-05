@@ -1,13 +1,54 @@
 """Thin same-origin gateway to the existing chat API."""
 
 import os
+import ipaddress
+import logging
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException
+from dotenv import dotenv_values
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .local_asr import router as local_asr_router
-from .security import require_gateway_token
+from .realtime_gateway import build_realtime_router
+from .security import load_identity_public_key, require_chat_identity, require_gateway_token
+from .web_auth import create_web_auth_service
+
+
+log = logging.getLogger("uvicorn.error")
+
+
+def memory_warm_url(chat_url: str) -> str | None:
+    """Only send the internal preload secret to a loopback chat service."""
+    try:
+        parts = urlsplit(chat_url)
+        host = parts.hostname or ""
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = host.casefold() == "localhost"
+        if (
+            parts.scheme not in {"http", "https"}
+            or not loopback
+            or parts.username
+            or parts.password
+        ):
+            return None
+        return urlunsplit((parts.scheme, parts.netloc, "/internal/memory/warm", "", ""))
+    except ValueError:
+        return None
+
+
+def openai_api_key(env_file: Path | None = None) -> str:
+    """Prefer the project dotenv credential over an inherited shell value."""
+    path = env_file if env_file is not None else Path(__file__).resolve().parent.parent / ".env"
+    values = dotenv_values(path, interpolate=False)
+    if "OPENAI_API_KEY" in values:
+        return values["OPENAI_API_KEY"] or ""
+    return os.getenv("OPENAI_API_KEY", "")
 
 
 class ChatRequest(BaseModel):
@@ -41,6 +82,8 @@ def create_app(
     timeout_seconds: float | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     gateway_token: str | None = None,
+    identity_public_key=None,
+    replay_db_path: str | None = None,
 ) -> FastAPI:
     """Build the gateway; upstream configuration is kept on the server."""
     url = upstream_url if upstream_url is not None else os.getenv("CHAT_API_URL", "")
@@ -57,14 +100,63 @@ def create_app(
 
     app = FastAPI(title="Astrology Chat Gateway")
     app.state.gateway_token = configured_token
+    app.state.identity_public_key = (
+        identity_public_key if identity_public_key is not None else load_identity_public_key()
+    )
+    app.state.replay_db_path = replay_db_path or os.getenv(
+        "ASTRO_GATEWAY_REPLAY_DB",
+        str(
+            Path.home()
+            / ".local"
+            / "share"
+            / "conversational-ai-for-astro"
+            / "gateway-replays.sqlite3"
+        ),
+    )
     app.include_router(local_asr_router)
 
-    @app.post(
-        "/api/chat",
-        response_model=ChatResponse,
-        dependencies=[Depends(require_gateway_token)],
-    )
-    async def chat(payload: ChatRequest) -> ChatResponse:
+    web_origin = os.getenv("ASTRO_WEB_AUTH_ORIGIN", "").strip()
+    if web_origin:
+        warm_token = os.getenv("ASTRO_MEMORY_WARM_TOKEN", "")
+        warm_url = memory_warm_url(url) if warm_token else None
+
+        async def warm_memory(user_id: str, session_id: str) -> None:
+            async with httpx.AsyncClient(timeout=2.0, transport=transport) as client:
+                response = await client.post(
+                    warm_url,
+                    headers={"Authorization": f"Bearer {warm_token}"},
+                    json={"user_id": user_id, "session_id": session_id},
+                )
+                response.raise_for_status()
+
+        if warm_token and not warm_url:
+            log.warning("Memory preload disabled: chat service is not on loopback")
+        auth = create_web_auth_service(
+            public_origin=web_origin, warm_memory=warm_memory if warm_url else None
+        )
+        app.state.web_auth_service = auth
+        app.include_router(auth.router)
+
+        async def authenticate_browser(request: Request) -> tuple[str, str]:
+            identity = auth.require_identity(request)
+            return identity.user_id, identity.session_id
+
+        async def realtime_chat(user_id: str, session_id: str, message: str) -> str:
+            payload = ChatRequest(user_id=user_id, session_id=session_id, message=message)
+            response = await forward_chat(payload)
+            return response.response
+
+        app.include_router(
+            build_realtime_router(
+                authenticate_browser,
+                realtime_chat,
+                api_key=openai_api_key(),
+                identity_is_active=auth.identity_is_active,
+            )
+        )
+
+    async def forward_chat(payload: ChatRequest) -> ChatResponse:
+        """Forward one trusted identity-bound request to the existing MyNaksh API."""
         if not url:
             raise HTTPException(status_code=503, detail="Chat service is not configured")
 
@@ -94,6 +186,21 @@ def create_app(
         if result.user_id != payload.user_id or result.session_id != payload.session_id:
             raise HTTPException(status_code=502, detail="Chat service returned an invalid response")
         return result
+
+    @app.post(
+        "/api/chat",
+        response_model=ChatResponse,
+        dependencies=[Depends(require_gateway_token)],
+    )
+    async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
+        await require_chat_identity(request, payload)
+        return await forward_chat(payload)
+
+    if web_origin:
+        web_root = Path(__file__).resolve().parent.parent / "web"
+        if (web_root / "index.html").is_file() and (web_root / "app.js").is_file():
+            # Mount last so API/auth/realtime routes always take precedence.
+            app.mount("/", StaticFiles(directory=web_root, html=True), name="web")
 
     return app
 
