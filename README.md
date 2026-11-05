@@ -1,52 +1,133 @@
-# Starlight local astrology chat
+# MyNaksh Voice Assistant
 
-The supported UI is the Streamlit app in `streamlit_app.py`. FastAPI (`app.main`) provides a loopback gateway to an existing assignment chat endpoint and optional local Whisper.cpp transcription. Older vanilla frontend files remain in the repository but are not served by the gateway; use Streamlit as the chat UI.
+MyNaksh Voice Assistant is a browser-based voice interface to the MyNaksh chat and memory service. Instead of submitting a structured API request, a signed-in user can ask questions aloud and receive spoken responses informed by their stored preferences and conversation context. It supports general personal queries, including the topics illustrated in the MyNaksh dataset. Users can speak without choosing a language and interrupt the assistant while it is speaking.
 
-## Run locally
+## Local setup
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/). Replace the example `CHAT_API_URL` with the full, authorized assignment endpoint. This one-shell example gives both local services the same random server-only token and binds them to loopback:
+Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), an OpenAI API key with Realtime and chat model access, and a browser with microphone access. The app uses two local processes: the copied MyNaksh service and the Astro web gateway.
 
-```sh
+In the project directory, install dependencies and create a private `.env` file containing `OPENAI_API_KEY=your-key`. Replace `your-key` with your key; never commit this file or put the key in the browser.
+
+```bash
+cd ~/Code/conversational-ai-for-astro
 uv sync
-export ASTRO_GATEWAY_TOKEN="$(uv run python -c 'import secrets; print(secrets.token_hex(32))')"
-export CHAT_API_URL="https://<assignment-host>/<chat-path>"
-export GATEWAY_URL="http://127.0.0.1:8000"
-
-# Optional local transcription settings; see below.
-export WHISPER_CLI="/path/to/whisper.cpp/build/bin/whisper-cli"
-export WHISPER_MODEL="/path/to/whisper.cpp/models/ggml-small.bin"
-export WHISPER_LANGUAGE="auto"
-
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 &
-gateway_pid=$!
-trap 'kill "$gateway_pid" 2>/dev/null || true' EXIT
-uv run streamlit run streamlit_app.py --server.address 127.0.0.1 --server.port 8501
+nano .env
+chmod 600 .env
 ```
 
-Open <http://127.0.0.1:8501>, create a local account, and sign in. Keep both services on loopback; do not expose them to untrusted users or the public internet. Both `/api/chat` and `/api/transcribe` require the same `ASTRO_GATEWAY_TOKEN`, at least 32 ASCII non-whitespace characters. It is sent server-to-server as a bearer token and is not included in the chat JSON payload.
+Create a private shared token once for the gateway's memory-preload requests. This preserves an existing token and does not print it:
 
-`CHAT_API_URL` must accept JSON containing `user_id`, `session_id`, and `message`, then return `request_id`, integer `message_id` and `response_id`, matching `user_id` and `session_id`, string `response`, and string-array `context_used`. The gateway does not configure upstream authorization headers or credentials. If the assignment endpoint requires separate authentication, this gateway needs an authorized integration before it can use that endpoint; do not put credentials in the URL. Upstream calls may incur costs according to the assignment provider's account and terms.
+```bash
+umask 077
+mkdir -p "$HOME/.local/share/conversational-ai-for-astro/local-demo"
+chmod 700 "$HOME/.local/share/conversational-ai-for-astro/local-demo"
+uv run python - <<'PY'
+import os
+import secrets
+from pathlib import Path
 
-The local SQLite account database defaults to `~/.local/share/conversational-ai-for-astro/accounts.sqlite3`; set `ASTRO_ACCOUNTS_DB` to override it. Passwords are stored as salted scrypt hashes. The local account screen gates the Streamlit UI, but the gateway token is a shared service credential, not an individual user identity. Account/session isolation and upstream memory behavior are not verified. Signing out clears the current Streamlit session. **New conversation** clears the displayed history and rotates the session ID but does not delete history held upstream.
-
-## Experimental live voice
-
-This is a local prototype built with `streamlit-webrtc`, not a production voice assistant. After you consent to live microphone streaming and automatic spoken replies, WebRTC sends audio frames to this app. A simple RMS-energy VAD segments speech using onset and silence thresholds; each completed turn is buffered and sent to the configured local transcription endpoint, then its transcript is sent to the chat endpoint. Replies are synthesized locally and played through the browser audio connection. The microphone remains active during playback; sustained speech attempts to stop queued playback and start a new turn.
-
-Live voice depends on browser/device microphone permissions, audio routing, microphone gain, and background noise. The VAD can miss speech or trigger on noise, so turn timing and barge-in are best-effort. This is not guaranteed full-duplex behavior. The local voice selector controls **read-aloud output only** (`en`, `hi`, or `bn`); it does not select the Whisper input language or provide code-switch recognition. Calls already started for transcription or chat cannot be canceled; late replies/audio are suppressed locally, but an upstream conversation update may already have occurred. Live upstream chat and local synthesis can add noticeable latency.
-
-## Local speech dependencies
-
-For transcription, install whisper.cpp and download a compatible model separately. Set `WHISPER_CLI` to its executable and `WHISPER_MODEL` to the model file. `WHISPER_LANGUAGE` defaults to `en`; it may be `auto` or a 2–3 letter language code such as `hi` or `bn`. Use a multilingual model for any language other than English (for example, `ggml-small.bin`, not an English-only `.en` model). The server accepts mono, 16 kHz, 16-bit PCM WAV up to 30 seconds and 8 MiB. Whisper runs locally, has a 60-second timeout, and uses a temporary directory that is deleted after processing. Actual recognition accuracy and latency depend on the model and hardware.
-
-For spoken replies, install the eSpeak-NG shared library (`libespeak-ng.so.1`) and the voice data for the desired languages on the host. Synthesis runs in a bounded local worker, returns mono PCM16 WAV, and supports English, Hindi, and Bengali output voices. It has a 15-second timeout and limits reply text to 500 characters; pronunciation quality is not guaranteed. No paid speech provider is used by these local paths. The separate **Record a voice message** control is buffered: it also requires consent and an explicit **Transcribe recording** action, and the resulting transcript still requires **Send**.
-
-## Tests and evidence limits
-
-```sh
-uv run pytest
+path = Path.home() / '.local/share/conversational-ai-for-astro/local-demo/memory-warm-token'
+try:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+except FileExistsError:
+    pass
+else:
+    with os.fdopen(fd, 'w') as token_file:
+        token_file.write(secrets.token_urlsafe(32) + '\n')
+PY
+chmod 600 "$HOME/.local/share/conversational-ai-for-astro/local-demo/memory-warm-token"
 ```
 
-Tests cover account and gateway contracts, local VAD/turn-state behavior, stale-result handling, TTS bounds, and synthetic audio transport with controlled dependencies. They do not provide acoustic evidence from a physical microphone or headed browser, validate real Whisper transcription quality, prove pronunciation quality, or validate the configured assignment model's behavior. No actual astrology-only/domain policy is enforced: arbitrary user messages are forwarded to the configured upstream.
+Start the copied MyNaksh service. These commands use the OpenAI key from `.env`, select the experimental faster single-call mode, and reuse the existing local demo memory database. Set `DATABASE_PATH` to a different private SQLite file if you want a fresh memory store. **Only one MyNaksh process may write to this database while fast mode is running**; stop any older service using the same database first.
 
-Use only for local trusted testing. The local account screen does not protect direct API callers who obtain the shared gateway token, and this project does not guarantee account isolation or provider-side memory isolation. Check the upstream's privacy and billing behavior before sending data; model calls may be billable.
+```bash
+export LLM_API_KEY="$(uv run python -c 'from dotenv import dotenv_values; print(dotenv_values(".env").get("OPENAI_API_KEY", ""))')"
+export LLM_PROVIDER="openai-compatible"
+export LLM_BASE_URL="https://api.openai.com/v1"
+export LLM_MODEL="gpt-4.1-mini"
+export ASTRO_MEMORY_FAST="1"
+export DATABASE_PATH="$HOME/.local/share/conversational-ai-for-astro/local-demo/memory.sqlite3"
+ASTRO_MEMORY_WARM_TOKEN="$(< "$HOME/.local/share/conversational-ai-for-astro/local-demo/memory-warm-token")"
+export ASTRO_MEMORY_WARM_TOKEN
+
+mkdir -p "$(dirname "$DATABASE_PATH")"
+chmod 700 "$(dirname "$DATABASE_PATH")"
+uv run uvicorn astro_memory.main:app --host 127.0.0.1 --port 8002
+```
+
+In a second terminal, start the Astro gateway. `ASTRO_WEB_AUTH_ORIGIN` must exactly match the address you open; this example uses `localhost`.
+
+```bash
+cd ~/Code/conversational-ai-for-astro
+export CHAT_API_URL="http://127.0.0.1:8002/chat"
+export ASTRO_WEB_AUTH_ORIGIN="http://localhost:8501"
+export ASTRO_ACCOUNTS_DB="$HOME/.local/share/conversational-ai-for-astro/accounts.sqlite3"
+export ASTRO_WEB_SESSIONS_DB="$HOME/.local/share/conversational-ai-for-astro/web-sessions.sqlite3"
+ASTRO_MEMORY_WARM_TOKEN="$(< "$HOME/.local/share/conversational-ai-for-astro/local-demo/memory-warm-token")"
+export ASTRO_MEMORY_WARM_TOKEN
+
+mkdir -p "$(dirname "$ASTRO_ACCOUNTS_DB")"
+chmod 700 "$(dirname "$ASTRO_ACCOUNTS_DB")"
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8501
+```
+
+Open <http://localhost:8501>, sign in or create a local account, and click **Start talking**. Allow microphone access when the browser asks. Pause after speaking to let the assistant respond; speak again to interrupt it. Click **End conversation** when finished. Session cookies are HttpOnly, same-site, and expire after one hour. Keep both servers on loopback for local use.
+
+## Voice behavior and cost
+
+The browser sends audio to OpenAI Realtime over WebRTC; the Astro server handles signaling and keeps the provider key server-side. The server configures model `gpt-realtime-2.1`, transcription model `gpt-4o-mini-transcribe`, and the `marin` output voice. The UI has no manual language selector. Each voice turn calls the local MyNaksh service through `CHAT_API_URL` before the reply is spoken. Response time depends on speech detection, network conditions, both models, and audio playback; **an under-one-second spoken response is not guaranteed**.
+
+The faster mode combines context selection and answer generation in one model call. It gives the model the signed-in user's candidate memories before relevance selection, so an irrelevant memory can influence a reply. Its multilingual and memory behavior requires further real-world validation. Set `ASTRO_MEMORY_FAST=0` to use the original two-agent flow instead. See [MyNaksh integration](astro_memory/README.md) for the copied code and its limitations.
+
+In faster mode, the gateway preloads the authenticated user's memory and session history when they sign in, register, or restore a session. The shared token authorizes this internal request, which is sent only to a loopback chat service. If preload fails, the service loads the data when it is needed. The process-local cache is bounded and reloads evicted entries from SQLite; restarting it clears cached data, not the database. External database writers can make the cache stale, so the copied service must remain its sole writer.
+
+The optimized and original modes can both misinterpret language preferences or recall context incorrectly. A synthetic run of the 30-turn golden dataset returned a response for every turn in both modes, but manual review found language and memory errors. The run does not establish real-time voice latency or guarantee correct answers.
+
+Realtime API usage may be billable under the configured provider account. MyNaksh may also make separately billable model calls. Check both services' configuration, cost, and data handling before use.
+
+## Authentication and limits
+
+The browser UI uses a same-origin, server-owned account/session cookie. `ASTRO_WEB_AUTH_ORIGIN` enables the auth routes, realtime routes, and static `web/` UI; without it, the browser app is not mounted. The Realtime gateway binds calls to the authenticated account and session and checks that the session remains active. It limits the server to four concurrent voice sessions and each session to one hour.
+
+The voice instructions require the model to call MyNaksh's `ask_mynaksh` tool and tell it to speak only the tool's answer. Model instructions and gateway policy checks are not a security boundary against a modified client; browser data-channel events remain client-controlled. The copied MyNaksh endpoint accepts caller-supplied user IDs and has no independent authentication. Other local processes can call it directly, bypassing browser authentication and the Realtime gateway.
+
+Keep the app and MyNaksh services on loopback for trusted local testing. The shared `ASTRO_GATEWAY_TOKEN` and signed identity assertion still protect the legacy `/api/chat` route; they do not authenticate requests made directly to MyNaksh. Browser sign-in is not an online identity provider or production security boundary.
+
+## Configuration
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `ASTRO_WEB_AUTH_ORIGIN` | Exact bare browser origin; required to serve web/auth/realtime routes | Required for browser UI |
+| `ASTRO_ACCOUNTS_DB` | Local account database | `~/.local/share/conversational-ai-for-astro/accounts.sqlite3` |
+| `ASTRO_WEB_SESSIONS_DB` | Hashed browser-session database | `~/.local/share/conversational-ai-for-astro/web-sessions.sqlite3` |
+| `CHAT_API_URL` | Full MyNaksh chat endpoint URL | Required for tool calls |
+| `OPENAI_API_KEY` | Server-only Realtime credential; project `.env` takes precedence over inherited environment | Required for voice |
+| `DATABASE_PATH` | SQLite memory database used by the copied MyNaksh service | `memory.db` |
+| `ASTRO_MEMORY_FAST` | Set to `1` for the experimental single-call mode | Two-agent mode |
+| `ASTRO_MEMORY_WARM_TOKEN` | Same private token in both server processes; enables authenticated loopback memory preload | Preload disabled if unset |
+| `LLM_BASE_URL`, `LLM_API_KEY` | Model provider URL and credential for copied MyNaksh | Required for a configured chat model |
+| `LLM_PROVIDER`, `LLM_MODEL` | Model provider type and model name for copied MyNaksh | `openai-compatible`, `chatgpt/gpt-6.1-sol` |
+
+The MyNaksh endpoint accepts JSON with `user_id`, `session_id`, and `message`, and returns the existing response contract, including matching account/session IDs and a string `response`.
+
+## Tests
+
+```bash
+uv run pytest -q
+uv lock --check
+(cd web && npm test)
+```
+
+Browser tests use fake media and HTTP responses; they do not make provider calls or validate real microphone/audio quality, actual MyNaksh latency, or recognition quality.
+
+To compare the copied modes against the local golden dataset using temporary databases:
+
+```bash
+uv run python scripts/evaluate_golden.py --mode both
+```
+
+This sends synthetic dataset messages to the configured model provider and may incur API charges. It reports HTTP results, timings and exact context-key checks; answer quality, language and scope require separate review. Use `--output /private/path.json --include-responses` to save synthetic responses for that review.
+
+## Legacy Streamlit and gateway routes
+
+`streamlit_app.py` remains an optional older local demo; it is not the default UI. Its signed `/api/chat` flow requires `ASTRO_GATEWAY_TOKEN`, an Ed25519 private key via `ASTRO_IDENTITY_PRIVATE_KEY_FILE` in the Streamlit process, and the matching `ASTRO_IDENTITY_PUBLIC_KEY_FILE` plus `ASTRO_GATEWAY_REPLAY_DB` in the gateway process. Bearer-only `/api/chat` clients are rejected. Replay protection is per assertion, not exactly-once delivery. `/api/transcribe` remains a bearer-only optional local Whisper.cpp endpoint; its README setup and environment variables apply only to that legacy/local transcription path.
