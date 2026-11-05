@@ -16,9 +16,25 @@ from app.local_tts import (
     SynthesisTooLong,
     SynthesisUnavailable,
     UnsupportedLanguage,
+    synthesize_multilingual_wav_sync,
     synthesize_wav,
     synthesize_wav_sync,
 )
+
+
+def test_multilingual_speech_switches_voice_by_script(monkeypatch):
+    calls = []
+
+    def fake_synthesize(text, language):
+        calls.append((text, language))
+        return wav_bytes(seconds=0.1)
+
+    monkeypatch.setattr("app.local_tts.synthesize_wav_sync", fake_synthesize)
+    result = synthesize_multilingual_wav_sync("Hello नमस्ते বাংলা world")
+    assert [language for _, language in calls] == ["en", "hi", "bn", "en"]
+    assert "".join(text for text, _ in calls) == "Hello नमस्ते বাংলা world"
+    with wave.open(io.BytesIO(result), "rb") as audio:
+        assert audio.getnframes() == 4 * int(0.1 * 22050)
 
 
 def wav_bytes(seconds: float = 1, rate: int = 22050, channels: int = 1) -> bytes:

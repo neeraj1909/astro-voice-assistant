@@ -6,6 +6,7 @@ import io
 import subprocess
 import sys
 import threading
+import unicodedata
 import wave
 from pathlib import Path
 
@@ -203,6 +204,54 @@ def synthesize_wav_sync(text: str, language: str = "en") -> bytes:
         return _validate_wave(result.stdout)
     finally:
         _PROCESS_LOCK.release()
+
+
+def synthesize_multilingual_wav_sync(text: str, language: str = "auto") -> bytes:
+    """Choose voices by script for mixed English, Devanagari and Bengali text.
+
+    Latin-script Hindi or Bengali cannot be identified reliably from script alone.
+    """
+    _prepare(text, "en")
+    if language != "auto":
+        return synthesize_wav_sync(text, language)
+
+    segments: list[tuple[str, str]] = []
+    current_language = None
+    current_text = ""
+    for char in text:
+        code = ord(char)
+        if 0x0900 <= code <= 0x097F:
+            char_language = "hi"
+        elif 0x0980 <= code <= 0x09FF:
+            char_language = "bn"
+        elif unicodedata.category(char).startswith("L"):
+            char_language = "en"
+        else:
+            char_language = current_language
+        if char_language and current_language and char_language != current_language:
+            segments.append((current_language, current_text))
+            current_text = ""
+        current_language = char_language or current_language
+        current_text += char
+    if current_text.strip():
+        segments.append((current_language or "en", current_text))
+
+    frames = bytearray()
+    for voice, segment in segments:
+        if not segment.strip():
+            continue
+        audio = synthesize_wav_sync(segment, voice)
+        with wave.open(io.BytesIO(audio), "rb") as wav:
+            frames.extend(wav.readframes(wav.getnframes()))
+        if len(frames) > SAMPLE_RATE * 2 * MAX_AUDIO_SECONDS:
+            raise SynthesisTooLong("Generated audio exceeds the duration limit")
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(SAMPLE_RATE)
+        wav.writeframes(frames)
+    return _validate_wave(output.getvalue())
 
 
 async def synthesize_wav(text: str, language: str = "en") -> bytes:
